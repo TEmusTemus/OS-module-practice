@@ -1,0 +1,1269 @@
+#include <iostream>
+#include <fstream>
+#include <cstring>
+#include <sstream>
+#include <vector>
+#include <iomanip>
+#include <ctime>
+
+// File system constants
+const unsigned int BLOCK_SIZE = 1024;
+const unsigned int TOTAL_BLOCKS = 1024;
+const unsigned int MEMORY_SIZE = BLOCK_SIZE * TOTAL_BLOCKS;
+const unsigned int MAX_INODES = 128;
+const unsigned int INODE_SIZE = 128;
+const unsigned int FIRST_DATA_BLOCK = 1 + (MAX_INODES * INODE_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
+const unsigned int MAX_FILENAME = 28;
+const unsigned int MAX_FILE_SIZE = 10 * BLOCK_SIZE; // 10 direct blocks for simplicity
+const unsigned int MAX_PATH_LENGTH = 256;
+
+// File system structures
+struct SuperBlock {
+    unsigned int magic;         // Magic number to identify the file system
+    unsigned int blockSize;     // Size of each block
+    unsigned int totalBlocks;   // Total number of blocks
+    unsigned int freeBlocks;    // Number of free blocks
+    unsigned int maxInodes;     // Maximum number of inodes
+    unsigned int freeInodes;    // Number of free inodes
+    unsigned int firstFreeBlock; // First free block
+    unsigned int firstFreeInode; // First free inode
+};
+
+struct Inode {
+    unsigned int type;          // 0 = unused, 1 = directory, 2 = regular file
+    unsigned int size;          // File size in bytes
+    unsigned int links;         // Number of links to this inode
+    time_t creationTime;        // Creation time
+    time_t modificationTime;    // Last modification time
+    unsigned int directBlocks[10]; // Direct block pointers
+};
+
+struct DirectoryEntry {
+    unsigned int inode;         // Inode number
+    char name[MAX_FILENAME];    // File name
+};
+
+class FileSystem {
+private:
+    char* memory;               // In-memory representation of the file system
+    unsigned int currentInodeNumber; // Current working directory inode number
+    std::string currentPath;    // Current path
+
+    // Helper methods
+    unsigned int allocateBlock();
+    unsigned int allocateInode();
+    void freeBlock(unsigned int blockNum);
+    void freeInode(unsigned int inodeNum);
+    Inode* getInode(unsigned int inodeNum);
+    unsigned int findInode(const std::string& path);
+    std::vector<std::string> splitPath(const std::string& path);
+    bool isDirectory(unsigned int inodeNum);
+    bool isFile(unsigned int inodeNum);
+    void addDirectoryEntry(unsigned int dirInodeNum, unsigned int fileInodeNum, const std::string& name);
+    void removeDirectoryEntry(unsigned int dirInodeNum, const std::string& name);
+    void initializeFileSystem();
+    void saveFileSystem();
+    void dumpSuperBlock();
+    void verifyFreeBlockList();
+
+public:
+    FileSystem();
+    ~FileSystem();
+    
+    void run();
+    
+    // File system operations
+    void cmdLs(const std::string& args);
+    void cmdCd(const std::string& args);
+    void cmdMkdir(const std::string& args);
+    void cmdRmdir(const std::string& args);
+    void cmdTouch(const std::string& args);
+    void cmdRm(const std::string& args);
+    void cmdCat(const std::string& args);
+    void cmdWrite(const std::string& args);
+    void cmdDebug();
+};
+
+FileSystem::FileSystem() {
+    // Allocate memory for the file system
+    memory = new char[MEMORY_SIZE];
+    
+    // Initialize to zeros first
+    memset(memory, 0, MEMORY_SIZE);
+    
+    // Try to load from filesystem.dat
+    std::ifstream file("filesystem.dat", std::ios::binary);
+    bool needInitialization = true;
+    
+    if (file) {
+        // File exists, try to load it
+        file.read(memory, MEMORY_SIZE);
+        file.close();
+        
+        // Validate the loaded file system
+        SuperBlock* superBlock = reinterpret_cast<SuperBlock*>(memory);
+        if (superBlock->magic == 0x12345678 && 
+            superBlock->firstFreeBlock >= FIRST_DATA_BLOCK && 
+            superBlock->firstFreeBlock < TOTAL_BLOCKS) {
+            
+            std::cout << "Loaded existing file system." << std::endl;
+            needInitialization = false;
+        } else {
+            std::cout << "Warning: Corrupted file system detected, reinitializing..." << std::endl;
+        }
+    } else {
+        std::cout << "No existing file system found, initializing new one..." << std::endl;
+    }
+    
+    if (needInitialization) {
+        initializeFileSystem();
+    }
+    
+    // Set current directory to root
+    currentInodeNumber = 0;
+    currentPath = "/";
+}
+
+FileSystem::~FileSystem() {
+    saveFileSystem();
+    delete[] memory;
+}
+
+void FileSystem::initializeFileSystem() {
+    std::cout << "Initializing file system..." << std::endl;
+    
+    // Initialize memory to zeros
+    memset(memory, 0, MEMORY_SIZE);
+    
+    // Initialize SuperBlock
+    SuperBlock* superBlock = reinterpret_cast<SuperBlock*>(memory);
+    superBlock->magic = 0x12345678;
+    superBlock->blockSize = BLOCK_SIZE;
+    superBlock->totalBlocks = TOTAL_BLOCKS;
+    superBlock->freeBlocks = TOTAL_BLOCKS - FIRST_DATA_BLOCK;
+    superBlock->maxInodes = MAX_INODES;
+    superBlock->freeInodes = MAX_INODES - 1; // Reserve inode 0 for root directory
+    superBlock->firstFreeBlock = FIRST_DATA_BLOCK; // Start of data blocks
+    superBlock->firstFreeInode = 1; // Inode 0 is reserved for root directory
+    
+    std::cout << "SuperBlock initialized:" << std::endl;
+    std::cout << "First free block: " << superBlock->firstFreeBlock << std::endl;
+    std::cout << "Free blocks: " << superBlock->freeBlocks << std::endl;
+    
+    // Initialize free block list
+    for (unsigned int i = FIRST_DATA_BLOCK; i < TOTAL_BLOCKS - 1; i++) {
+        unsigned int* nextFree = reinterpret_cast<unsigned int*>(memory + i * BLOCK_SIZE);
+        *nextFree = i + 1;
+    }
+    
+    // Last block points to 0 (end of list)
+    unsigned int* lastBlock = reinterpret_cast<unsigned int*>(memory + (TOTAL_BLOCKS - 1) * BLOCK_SIZE);
+    *lastBlock = 0;
+    
+    // Initialize free inode list
+    for (unsigned int i = 1; i < MAX_INODES - 1; i++) {
+        Inode* inode = reinterpret_cast<Inode*>(memory + BLOCK_SIZE + i * INODE_SIZE);
+        inode->type = 0; // Unused
+        inode->size = i + 1; // Next free inode
+    }
+    
+    // Last inode points to 0 (end of list)
+    Inode* lastInode = reinterpret_cast<Inode*>(memory + BLOCK_SIZE + (MAX_INODES - 1) * INODE_SIZE);
+    lastInode->type = 0;
+    lastInode->size = 0;
+    
+    // Initialize root directory
+    Inode* rootInode = reinterpret_cast<Inode*>(memory + BLOCK_SIZE + 0 * INODE_SIZE);
+    rootInode->type = 1; // Directory
+    rootInode->size = 0;
+    rootInode->links = 1;
+    rootInode->creationTime = time(nullptr);
+    rootInode->modificationTime = rootInode->creationTime;
+    
+    // Allocate first block for root directory
+    unsigned int rootBlock = allocateBlock();
+    if (rootBlock == 0) {
+        std::cout << "Error: Failed to allocate block for root directory" << std::endl;
+        return;
+    }
+    
+    rootInode->directBlocks[0] = rootBlock;
+    
+    // Initialize the root directory's first block with "." and ".." entries
+    DirectoryEntry* rootDir = reinterpret_cast<DirectoryEntry*>(memory + rootBlock * BLOCK_SIZE);
+    rootDir[0].inode = 0;
+    strcpy(rootDir[0].name, ".");
+    
+    rootDir[1].inode = 0;
+    strcpy(rootDir[1].name, "..");
+    
+    rootInode->size = 2 * sizeof(DirectoryEntry);
+    
+    // Verify the file system initialization
+    verifyFreeBlockList();
+    
+    // Save the initialized file system
+    saveFileSystem();
+}
+
+void FileSystem::saveFileSystem() {
+    // Verify the file system before saving
+    SuperBlock* superBlock = reinterpret_cast<SuperBlock*>(memory);
+    if (superBlock->magic != 0x12345678 || 
+        superBlock->firstFreeBlock == 0 || 
+        superBlock->firstFreeBlock >= TOTAL_BLOCKS) {
+        
+        std::cout << "Warning: Corrupted file system detected before saving." << std::endl;
+        dumpSuperBlock();
+        return;
+    }
+    
+    std::ofstream file("filesystem.dat", std::ios::binary);
+    if (file) {
+        file.write(memory, MEMORY_SIZE);
+        file.close();
+        std::cout << "File system saved." << std::endl;
+    } else {
+        std::cout << "Error: Could not save file system" << std::endl;
+    }
+}
+
+unsigned int FileSystem::allocateBlock() {
+    SuperBlock* superBlock = reinterpret_cast<SuperBlock*>(memory);
+    
+    std::cout << "Debug: Free blocks: " << superBlock->freeBlocks 
+              << ", First free block: " << superBlock->firstFreeBlock << std::endl;
+    
+    if (superBlock->freeBlocks == 0 || superBlock->firstFreeBlock == 0 || 
+        superBlock->firstFreeBlock >= TOTAL_BLOCKS) {
+        std::cout << "Debug: No free blocks available. Free blocks: " << superBlock->freeBlocks 
+                  << ", First free block: " << superBlock->firstFreeBlock << std::endl;
+        return 0; // No free blocks or invalid firstFreeBlock
+    }
+    
+    unsigned int blockNum = superBlock->firstFreeBlock;
+    
+    // Get the next free block from the current block
+    unsigned int* nextFree = reinterpret_cast<unsigned int*>(memory + blockNum * BLOCK_SIZE);
+    
+    // Check if the next free block is valid
+    if (*nextFree >= TOTAL_BLOCKS && *nextFree != 0) {
+        std::cout << "Debug: Invalid next free block: " << *nextFree << std::endl;
+        return 0;
+    }
+    
+    superBlock->firstFreeBlock = *nextFree;
+    superBlock->freeBlocks--;
+    
+    // Clear the allocated block
+    memset(memory + blockNum * BLOCK_SIZE, 0, BLOCK_SIZE);
+    
+    std::cout << "Debug: Allocated block " << blockNum << std::endl;
+    return blockNum;
+}
+
+void FileSystem::freeBlock(unsigned int blockNum) {
+    if (blockNum < FIRST_DATA_BLOCK || blockNum >= TOTAL_BLOCKS) {
+        std::cout << "Error: Attempt to free invalid block " << blockNum << std::endl;
+        return;
+    }
+    
+    SuperBlock* superBlock = reinterpret_cast<SuperBlock*>(memory);
+    
+    // Clear the block
+    memset(memory + blockNum * BLOCK_SIZE, 0, BLOCK_SIZE);
+    
+    // Add the block to the free list
+    unsigned int* nextFree = reinterpret_cast<unsigned int*>(memory + blockNum * BLOCK_SIZE);
+    *nextFree = superBlock->firstFreeBlock;
+    superBlock->firstFreeBlock = blockNum;
+    superBlock->freeBlocks++;
+}
+
+unsigned int FileSystem::allocateInode() {
+    SuperBlock* superBlock = reinterpret_cast<SuperBlock*>(memory);
+    
+    if (superBlock->freeInodes == 0 || superBlock->firstFreeInode == 0 || 
+        superBlock->firstFreeInode >= MAX_INODES) {
+        std::cout << "Error: No free inodes available" << std::endl;
+        return 0; // No free inodes
+    }
+    
+    unsigned int inodeNum = superBlock->firstFreeInode;
+    Inode* inode = reinterpret_cast<Inode*>(memory + BLOCK_SIZE + inodeNum * INODE_SIZE);
+    
+    // Get the next free inode
+    superBlock->firstFreeInode = inode->size;
+    superBlock->freeInodes--;
+    
+    // Initialize the inode
+    memset(inode, 0, INODE_SIZE);
+    inode->creationTime = time(nullptr);
+    inode->modificationTime = inode->creationTime;
+    
+    return inodeNum;
+}
+
+void FileSystem::freeInode(unsigned int inodeNum) {
+    if (inodeNum == 0 || inodeNum >= MAX_INODES) {
+        std::cout << "Error: Attempt to free invalid inode " << inodeNum << std::endl;
+        return;
+    }
+    
+    SuperBlock* superBlock = reinterpret_cast<SuperBlock*>(memory);
+    Inode* inode = reinterpret_cast<Inode*>(memory + BLOCK_SIZE + inodeNum * INODE_SIZE);
+    
+    // Free all blocks associated with this inode
+    if (inode->type == 2) { // Regular file
+        for (unsigned int i = 0; i < 10; i++) {
+            if (inode->directBlocks[i] != 0) {
+                freeBlock(inode->directBlocks[i]);
+                inode->directBlocks[i] = 0;
+            }
+        }
+    } else if (inode->type == 1) { // Directory
+        // Only free the blocks, not the directory entries (those should be removed first)
+        for (unsigned int i = 0; i < 10; i++) {
+            if (inode->directBlocks[i] != 0) {
+                freeBlock(inode->directBlocks[i]);
+                inode->directBlocks[i] = 0;
+            }
+        }
+    }
+    
+    // Add the inode to the free list
+    inode->type = 0; // Mark as unused
+    inode->size = superBlock->firstFreeInode;
+    superBlock->firstFreeInode = inodeNum;
+    superBlock->freeInodes++;
+}
+
+Inode* FileSystem::getInode(unsigned int inodeNum) {
+    if (inodeNum >= MAX_INODES) {
+        return nullptr;
+    }
+    return reinterpret_cast<Inode*>(memory + BLOCK_SIZE + inodeNum * INODE_SIZE);
+}
+
+bool FileSystem::isDirectory(unsigned int inodeNum) {
+    Inode* inode = getInode(inodeNum);
+    return inode && inode->type == 1;
+}
+
+bool FileSystem::isFile(unsigned int inodeNum) {
+    Inode* inode = getInode(inodeNum);
+    return inode && inode->type == 2;
+}
+
+std::vector<std::string> FileSystem::splitPath(const std::string& path) {
+    std::vector<std::string> components;
+    std::istringstream iss(path);
+    std::string component;
+    
+    // Skip leading slash
+    if (!path.empty() && path[0] == '/') {
+        iss.ignore();
+    }
+    
+    while (std::getline(iss, component, '/')) {
+        if (!component.empty()) {
+            components.push_back(component);
+        }
+    }
+    
+    return components;
+}
+
+unsigned int FileSystem::findInode(const std::string& path) {
+    // Handle empty path or root
+    if (path.empty() || path == "/") {
+        return 0;
+    }
+    
+    // Determine if the path is absolute or relative
+    unsigned int startInode = (path[0] == '/') ? 0 : currentInodeNumber;
+    
+    std::vector<std::string> components = splitPath(path);
+    
+    for (const auto& component : components) {
+        if (component == ".") {
+            continue;
+        } else if (component == "..") {
+            // Find parent directory
+            if (startInode == 0) {
+                continue; // Root's parent is root
+            }
+            
+            Inode* currentInode = getInode(startInode);
+            if (!currentInode || currentInode->type != 1) {
+                return 0; // Not a directory
+            }
+            
+            // Look for ".." entry
+            for (unsigned int i = 0; i < 10; i++) {
+                if (currentInode->directBlocks[i] == 0) {
+                    continue;
+                }
+                
+                DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(
+                    memory + currentInode->directBlocks[i] * BLOCK_SIZE);
+                
+                unsigned int entriesPerBlock = BLOCK_SIZE / sizeof(DirectoryEntry);
+                for (unsigned int j = 0; j < entriesPerBlock; j++) {
+                    if (entries[j].inode != 0 && strcmp(entries[j].name, "..") == 0) {
+                        startInode = entries[j].inode;
+                        goto found_parent;
+                    }
+                }
+            }
+            
+            return 0; // ".." entry not found
+            
+        found_parent:
+            continue;
+        }
+        
+        // Find the component in the current directory
+        Inode* currentInode = getInode(startInode);
+        if (!currentInode || currentInode->type != 1) {
+            return 0; // Not a directory
+        }
+        
+        bool found = false;
+        for (unsigned int i = 0; i < 10; i++) {
+            if (currentInode->directBlocks[i] == 0) {
+                continue;
+            }
+            
+            DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(
+                memory + currentInode->directBlocks[i] * BLOCK_SIZE);
+            
+            unsigned int entriesPerBlock = BLOCK_SIZE / sizeof(DirectoryEntry);
+            for (unsigned int j = 0; j < entriesPerBlock; j++) {
+                if (entries[j].inode != 0 && strcmp(entries[j].name, component.c_str()) == 0) {
+                    startInode = entries[j].inode;
+                    found = true;
+                    break;
+                }
+            }
+            
+            if (found) {
+                break;
+            }
+        }
+        
+        if (!found) {
+            return 0; // Component not found
+        }
+    }
+    
+    return startInode;
+}
+
+void FileSystem::addDirectoryEntry(unsigned int dirInodeNum, unsigned int fileInodeNum, const std::string& name) {
+    Inode* dirInode = getInode(dirInodeNum);
+    if (!dirInode || dirInode->type != 1) {
+        std::cout << "Error: Not a directory" << std::endl;
+        return;
+    }
+    
+    // Check if the name is too long
+    if (name.length() >= MAX_FILENAME) {
+        std::cout << "Error: File name too long" << std::endl;
+        return;
+    }
+    
+    // Check if the entry already exists
+    for (unsigned int i = 0; i < 10; i++) {
+        if (dirInode->directBlocks[i] == 0) {
+            continue;
+        }
+        
+        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(
+            memory + dirInode->directBlocks[i] * BLOCK_SIZE);
+        
+        unsigned int entriesPerBlock = BLOCK_SIZE / sizeof(DirectoryEntry);
+        for (unsigned int j = 0; j < entriesPerBlock; j++) {
+            if (entries[j].inode != 0 && strcmp(entries[j].name, name.c_str()) == 0) {
+                std::cout << "Error: Entry already exists" << std::endl;
+                return;
+            }
+        }
+    }
+    
+    // Find a free slot in the directory
+    for (unsigned int i = 0; i < 10; i++) {
+        // Allocate a new block if needed
+        if (dirInode->directBlocks[i] == 0) {
+            dirInode->directBlocks[i] = allocateBlock();
+            if (dirInode->directBlocks[i] == 0) {
+                std::cout << "Error: Failed to allocate block for directory" << std::endl;
+                return;
+            }
+            
+            // Clear the new block
+            memset(memory + dirInode->directBlocks[i] * BLOCK_SIZE, 0, BLOCK_SIZE);
+        }
+        
+        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(
+            memory + dirInode->directBlocks[i] * BLOCK_SIZE);
+        
+        unsigned int entriesPerBlock = BLOCK_SIZE / sizeof(DirectoryEntry);
+        for (unsigned int j = 0; j < entriesPerBlock; j++) {
+            if (entries[j].inode == 0) {
+                // Found a free slot
+                entries[j].inode = fileInodeNum;
+                strcpy(entries[j].name, name.c_str());
+                
+                // Update directory size
+                dirInode->size += sizeof(DirectoryEntry);
+                dirInode->modificationTime = time(nullptr);
+                return;
+            }
+        }
+    }
+    
+    std::cout << "Error: Directory full" << std::endl;
+}
+
+void FileSystem::removeDirectoryEntry(unsigned int dirInodeNum, const std::string& name) {
+    Inode* dirInode = getInode(dirInodeNum);
+    if (!dirInode || dirInode->type != 1) {
+        std::cout << "Error: Not a directory" << std::endl;
+        return;
+    }
+    
+    // Find the entry
+    for (unsigned int i = 0; i < 10; i++) {
+        if (dirInode->directBlocks[i] == 0) {
+            continue;
+        }
+        
+        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(
+            memory + dirInode->directBlocks[i] * BLOCK_SIZE);
+        
+        unsigned int entriesPerBlock = BLOCK_SIZE / sizeof(DirectoryEntry);
+        for (unsigned int j = 0; j < entriesPerBlock; j++) {
+            if (entries[j].inode != 0 && strcmp(entries[j].name, name.c_str()) == 0) {
+                // Found the entry, remove it
+                entries[j].inode = 0;
+                entries[j].name[0] = '\0';
+                
+                // Update directory size
+                dirInode->size -= sizeof(DirectoryEntry);
+                dirInode->modificationTime = time(nullptr);
+                return;
+            }
+        }
+    }
+    
+    std::cout << "Error: Entry not found" << std::endl;
+}
+
+void FileSystem::cmdLs(const std::string& args) {
+    unsigned int inodeNum = currentInodeNumber;
+    
+    // If a path is specified, find that inode
+    if (!args.empty()) {
+        inodeNum = findInode(args);
+        if (inodeNum == 0 && args != "/") {
+            std::cout << "Error: Path not found: " << args << std::endl;
+            return;
+        }
+    }
+    
+    Inode* inode = getInode(inodeNum);
+    if (!inode || inode->type != 1) {
+        std::cout << "Error: Not a directory" << std::endl;
+        return;
+    }
+    
+    // Print directory entries
+    std::cout << "Type  Size       Modified            Name" << std::endl;
+    std::cout << "----  ---------  -----------------   ----" << std::endl;
+    
+    for (unsigned int i = 0; i < 10; i++) {
+        if (inode->directBlocks[i] == 0) {
+            continue;
+        }
+        
+        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(
+            memory + inode->directBlocks[i] * BLOCK_SIZE);
+        
+        unsigned int entriesPerBlock = BLOCK_SIZE / sizeof(DirectoryEntry);
+        for (unsigned int j = 0; j < entriesPerBlock; j++) {
+            if (entries[j].inode != 0) {
+                Inode* entryInode = getInode(entries[j].inode);
+                if (entryInode) {
+                    char type = entryInode->type == 1 ? 'd' : 'f';
+                    std::cout << type << "     ";
+                    std::cout << std::setw(9) << entryInode->size << "  ";
+                    
+                    // Format modification time
+                    char timeStr[20];
+                    struct tm* timeinfo = localtime(&entryInode->modificationTime);
+                    strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", timeinfo);
+                    std::cout << timeStr << "   ";
+                    
+                    std::cout << entries[j].name << std::endl;
+                }
+            }
+        }
+    }
+}
+
+void FileSystem::cmdCd(const std::string& args) {
+    if (args.empty()) {
+        // cd to root
+        currentInodeNumber = 0;
+        currentPath = "/";
+        return;
+    }
+    
+    unsigned int inodeNum = findInode(args);
+    if (inodeNum == 0 && args != "/") {
+        std::cout << "Error: Directory not found: " << args << std::endl;
+        return;
+    }
+    
+    if (!isDirectory(inodeNum)) {
+        std::cout << "Error: Not a directory: " << args << std::endl;
+        return;
+    }
+    
+    currentInodeNumber = inodeNum;
+    
+    // Update current path
+    if (args[0] == '/') {
+        // Absolute path
+        if (args == "/") {
+            currentPath = "/";
+        } else {
+            currentPath = args;
+        }
+    } else {
+        // Relative path
+        if (currentPath == "/") {
+            currentPath += args;
+        } else {
+            currentPath += "/" + args;
+        }
+    }
+    
+    // Normalize the path
+    std::vector<std::string> components = splitPath(currentPath);
+    std::vector<std::string> normalizedComponents;
+    
+    for (const auto& component : components) {
+        if (component == ".") {
+            continue;
+        } else if (component == "..") {
+            if (!normalizedComponents.empty()) {
+                normalizedComponents.pop_back();
+            }
+        } else {
+            normalizedComponents.push_back(component);
+        }
+    }
+    
+    currentPath = "/";
+    for (const auto& component : normalizedComponents) {
+        if (!currentPath.empty() && currentPath.back() != '/') {
+            currentPath += "/";
+        }
+        currentPath += component;
+    }
+    
+    if (currentPath.empty()) {
+        currentPath = "/";
+    }
+}
+
+void FileSystem::cmdMkdir(const std::string& args) {
+    if (args.empty()) {
+        std::cout << "Usage: mkdir <directory>" << std::endl;
+        return;
+    }
+    
+    // Parse the path and name
+    std::string path = args;
+    std::string name;
+    
+    size_t lastSlash = path.find_last_of('/');
+    if (lastSlash != std::string::npos) {
+        name = path.substr(lastSlash + 1);
+        path = path.substr(0, lastSlash);
+        if (path.empty()) {
+            path = "/";
+        }
+    } else {
+        name = path;
+        path = ".";
+    }
+    
+    // Check if the name is valid
+    if (name.empty() || name == "." || name == "..") {
+        std::cout << "Error: Invalid directory name" << std::endl;
+        return;
+    }
+    
+    // Find the parent directory
+    unsigned int parentInodeNum = findInode(path);
+    if (parentInodeNum == 0 && path != "/" && path != ".") {
+        std::cout << "Error: Parent directory not found: " << path << std::endl;
+        return;
+    }
+    
+    if (!isDirectory(parentInodeNum)) {
+        std::cout << "Error: Not a directory: " << path << std::endl;
+        return;
+    }
+    
+    // Check if the directory already exists
+    std::string fullPath = (path == "/" || path == ".") ? name : path + "/" + name;
+    if (findInode(fullPath) != 0) {
+        std::cout << "Error: Directory already exists: " << fullPath << std::endl;
+        return;
+    }
+    
+    // Allocate a new inode for the directory
+    unsigned int newInodeNum = allocateInode();
+    if (newInodeNum == 0) {
+        std::cout << "Error: Failed to allocate inode for directory" << std::endl;
+        return;
+    }
+    
+    Inode* newInode = getInode(newInodeNum);
+    newInode->type = 1; // Directory
+    newInode->size = 0;
+    newInode->links = 1;
+    
+    // Allocate a block for the directory
+    unsigned int blockNum = allocateBlock();
+    if (blockNum == 0) {
+        std::cout << "Error: Failed to allocate block for directory" << std::endl;
+        freeInode(newInodeNum);
+        return;
+    }
+    
+    newInode->directBlocks[0] = blockNum;
+    
+    // Initialize the directory with "." and ".." entries
+    DirectoryEntry* dirEntries = reinterpret_cast<DirectoryEntry*>(memory + blockNum * BLOCK_SIZE);
+    
+    dirEntries[0].inode = newInodeNum;
+    strcpy(dirEntries[0].name, ".");
+    
+    dirEntries[1].inode = parentInodeNum;
+    strcpy(dirEntries[1].name, "..");
+    
+    newInode->size = 2 * sizeof(DirectoryEntry);
+    
+    // Add the new directory to the parent directory
+    addDirectoryEntry(parentInodeNum, newInodeNum, name);
+    
+    std::cout << "Created directory: " << name << std::endl;
+}
+
+void FileSystem::cmdRmdir(const std::string& args) {
+    if (args.empty()) {
+        std::cout << "Usage: rmdir <directory>" << std::endl;
+        return;
+    }
+    
+    // Find the directory
+    unsigned int inodeNum = findInode(args);
+    if (inodeNum == 0) {
+        std::cout << "Error: Directory not found: " << args << std::endl;
+        return;
+    }
+    
+    // Check if it's a directory
+    Inode* inode = getInode(inodeNum);
+    if (!inode || inode->type != 1) {
+        std::cout << "Error: Not a directory: " << args << std::endl;
+        return;
+    }
+    
+    // Check if it's not the root directory
+    if (inodeNum == 0) {
+        std::cout << "Error: Cannot remove root directory" << std::endl;
+        return;
+    }
+    
+    // Check if the directory is empty (only "." and ".." entries)
+    bool isEmpty = true;
+    for (unsigned int i = 0; i < 10; i++) {
+        if (inode->directBlocks[i] == 0) {
+            continue;
+        }
+        
+        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(
+            memory + inode->directBlocks[i] * BLOCK_SIZE);
+        
+        unsigned int entriesPerBlock = BLOCK_SIZE / sizeof(DirectoryEntry);
+        for (unsigned int j = 0; j < entriesPerBlock; j++) {
+            if (entries[j].inode != 0 && 
+                strcmp(entries[j].name, ".") != 0 && 
+                strcmp(entries[j].name, "..") != 0) {
+                isEmpty = false;
+                break;
+            }
+        }
+        
+        if (!isEmpty) {
+            break;
+        }
+    }
+    
+    if (!isEmpty) {
+        std::cout << "Error: Directory not empty: " << args << std::endl;
+        return;
+    }
+    
+    // Find the parent directory
+    unsigned int parentInodeNum = 0;
+    for (unsigned int i = 0; i < 10; i++) {
+        if (inode->directBlocks[i] == 0) {
+            continue;
+        }
+        
+        DirectoryEntry* entries = reinterpret_cast<DirectoryEntry*>(
+            memory + inode->directBlocks[i] * BLOCK_SIZE);
+        
+        unsigned int entriesPerBlock = BLOCK_SIZE / sizeof(DirectoryEntry);
+        for (unsigned int j = 0; j < entriesPerBlock; j++) {
+            if (entries[j].inode != 0 && strcmp(entries[j].name, "..") == 0) {
+                parentInodeNum = entries[j].inode;
+                break;
+            }
+        }
+        
+        if (parentInodeNum != 0) {
+            break;
+        }
+    }
+    
+    if (parentInodeNum == 0) {
+        std::cout << "Error: Could not find parent directory" << std::endl;
+        return;
+    }
+    
+    // Parse the path to get the directory name
+    std::string name;
+    size_t lastSlash = args.find_last_of('/');
+    if (lastSlash != std::string::npos) {
+        name = args.substr(lastSlash + 1);
+    } else {
+        name = args;
+    }
+    
+    // Remove the directory entry from the parent
+    removeDirectoryEntry(parentInodeNum, name);
+    
+    // Free the inode and its blocks
+    freeInode(inodeNum);
+    
+    std::cout << "Removed directory: " << args << std::endl;
+}
+
+void FileSystem::cmdTouch(const std::string& args) {
+    std::istringstream iss(args);
+    std::string path;
+    unsigned int size = 0;
+    
+    iss >> path;
+    if (path.empty()) {
+        std::cout << "Usage: touch <file> [size]" << std::endl;
+        return;
+    }
+    
+    // Check if size is specified
+    iss >> size;
+    
+    // Parse the path and name
+    std::string name;
+    std::string parentPath;
+    
+    size_t lastSlash = path.find_last_of('/');
+    if (lastSlash != std::string::npos) {
+        name = path.substr(lastSlash + 1);
+        parentPath = path.substr(0, lastSlash);
+        if (parentPath.empty()) {
+            parentPath = "/";
+        }
+    } else {
+        name = path;
+        parentPath = ".";
+    }
+    
+    // Check if the name is valid
+    if (name.empty() || name == "." || name == "..") {
+        std::cout << "Error: Invalid file name" << std::endl;
+        return;
+    }
+    
+    // Find the parent directory
+    unsigned int parentInodeNum = findInode(parentPath);
+    if (parentInodeNum == 0 && parentPath != "/" && parentPath != ".") {
+        std::cout << "Error: Parent directory not found: " << parentPath << std::endl;
+        return;
+    }
+    
+    if (!isDirectory(parentInodeNum)) {
+        std::cout << "Error: Not a directory: " << parentPath << std::endl;
+        return;
+    }
+    
+    // Check if the file already exists
+    std::string fullPath = (parentPath == "/" || parentPath == ".") ? name : parentPath + "/" + name;
+    unsigned int existingInodeNum = findInode(fullPath);
+    
+    if (existingInodeNum != 0) {
+        // File exists, just update its timestamp
+        Inode* existingInode = getInode(existingInodeNum);
+        if (existingInode) {
+            existingInode->modificationTime = time(nullptr);
+            std::cout << "Updated timestamp for: " << fullPath << std::endl;
+        }
+        return;
+    }
+    
+    // Allocate a new inode for the file
+    unsigned int newInodeNum = allocateInode();
+    if (newInodeNum == 0) {
+        std::cout << "Error: Failed to allocate inode for file" << std::endl;
+        return;
+    }
+    
+    Inode* newInode = getInode(newInodeNum);
+    newInode->type = 2; // Regular file
+    newInode->size = 0;
+    newInode->links = 1;
+    
+    // Add the new file to the parent directory
+    addDirectoryEntry(parentInodeNum, newInodeNum, name);
+    
+    // If size is specified, allocate blocks for the file
+    if (size > 0) {
+        unsigned int blocksNeeded = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        if (blocksNeeded > 10) {
+            std::cout << "Warning: Size too large, truncating to maximum file size" << std::endl;
+            blocksNeeded = 10;
+            size = 10 * BLOCK_SIZE;
+        }
+        
+        for (unsigned int i = 0; i < blocksNeeded; i++) {
+            unsigned int blockNum = allocateBlock();
+            if (blockNum == 0) {
+                std::cout << "Debug: Failed to allocate direct block " << i << std::endl;
+                std::cout << "Error: Failed to allocate blocks for file" << std::endl;
+                // Don't free the inode or remove the directory entry, just leave the file with fewer blocks
+                break;
+            }
+            
+            newInode->directBlocks[i] = blockNum;
+            newInode->size += BLOCK_SIZE;
+        }
+        
+        // Adjust the file size
+        newInode->size = size;
+    }
+    
+    std::cout << "Created file: " << fullPath << " with size " << newInode->size << " bytes" << std::endl;
+}
+
+void FileSystem::cmdRm(const std::string& args) {
+    if (args.empty()) {
+        std::cout << "Usage: rm <file>" << std::endl;
+        return;
+    }
+    
+    // Find the file
+    unsigned int inodeNum = findInode(args);
+    if (inodeNum == 0) {
+        std::cout << "Error: File not found: " << args << std::endl;
+        return;
+    }
+    
+    // Check if it's a regular file
+    Inode* inode = getInode(inodeNum);
+    if (!inode || inode->type != 2) {
+        std::cout << "Error: Not a regular file: " << args << std::endl;
+        return;
+    }
+    
+    // Parse the path to get the file name and parent directory
+    std::string name;
+    std::string parentPath;
+    
+    size_t lastSlash = args.find_last_of('/');
+    if (lastSlash != std::string::npos) {
+        name = args.substr(lastSlash + 1);
+        parentPath = args.substr(0, lastSlash);
+        if (parentPath.empty()) {
+            parentPath = "/";
+        }
+    } else {
+        name = args;
+        parentPath = ".";
+    }
+    
+    // Find the parent directory
+    unsigned int parentInodeNum = findInode(parentPath);
+    if (parentInodeNum == 0 && parentPath != "/" && parentPath != ".") {
+        std::cout << "Error: Parent directory not found: " << parentPath << std::endl;
+        return;
+    }
+    
+    // Remove the file entry from the parent directory
+    removeDirectoryEntry(parentInodeNum, name);
+    
+    // Free the inode and its blocks
+    freeInode(inodeNum);
+    
+    std::cout << "Removed file: " << args << std::endl;
+}
+
+void FileSystem::cmdCat(const std::string& args) {
+    if (args.empty()) {
+        std::cout << "Usage: cat <file>" << std::endl;
+        return;
+    }
+    
+    // Find the file
+    unsigned int inodeNum = findInode(args);
+    if (inodeNum == 0) {
+        std::cout << "Error: File not found: " << args << std::endl;
+        return;
+    }
+    
+    // Check if it's a regular file
+    Inode* inode = getInode(inodeNum);
+    if (!inode || inode->type != 2) {
+        std::cout << "Error: Not a regular file: " << args << std::endl;
+        return;
+    }
+    
+    // Display the file contents
+    std::cout << "File: " << args << " (size: " << inode->size << " bytes)" << std::endl;
+    std::cout << "Contents:" << std::endl;
+    
+    unsigned int bytesRemaining = inode->size;
+    for (unsigned int i = 0; i < 10 && bytesRemaining > 0; i++) {
+        if (inode->directBlocks[i] == 0) {
+            continue;
+        }
+        
+        char* blockData = memory + inode->directBlocks[i] * BLOCK_SIZE;
+        unsigned int bytesToRead = std::min(bytesRemaining, BLOCK_SIZE);
+        
+        // Display as hex dump
+        for (unsigned int j = 0; j < bytesToRead; j += 16) {
+            std::cout << std::hex << std::setw(8) << std::setfill('0') << j << ": ";
+            
+            // Hex values
+            for (unsigned int k = 0; k < 16 && j + k < bytesToRead; k++) {
+                std::cout << std::hex << std::setw(2) << std::setfill('0') 
+                          << static_cast<int>(blockData[j + k] & 0xFF) << " ";
+            }
+            
+            // Padding for incomplete lines
+            for (unsigned int k = std::min(16U, bytesToRead - j); k < 16; k++) {
+                std::cout << "   ";
+            }
+            
+            std::cout << " | ";
+            
+            // ASCII representation
+            for (unsigned int k = 0; k < 16 && j + k < bytesToRead; k++) {
+                char c = blockData[j + k];
+                std::cout << (c >= 32 && c <= 126 ? c : '.');
+            }
+            
+            std::cout << std::dec << std::endl;
+        }
+        
+        bytesRemaining -= bytesToRead;
+    }
+    
+    std::cout << std::dec << std::endl;
+}
+
+void FileSystem::cmdWrite(const std::string& args) {
+    std::istringstream iss(args);
+    std::string path;
+    std::string data;
+    
+    iss >> path;
+    if (path.empty()) {
+        std::cout << "Usage: write <file> <data>" << std::endl;
+        return;
+    }
+    
+    // Get the rest of the line as data
+    std::getline(iss >> std::ws, data);
+    
+    // Find the file
+    unsigned int inodeNum = findInode(path);
+    if (inodeNum == 0) {
+        std::cout << "Error: File not found: " << path << std::endl;
+        return;
+    }
+    
+    // Check if it's a regular file
+    Inode* inode = getInode(inodeNum);
+    if (!inode || inode->type != 2) {
+        std::cout << "Error: Not a regular file: " << path << std::endl;
+        return;
+    }
+    
+    // Calculate number of blocks needed
+    unsigned int dataSize = data.length();
+    unsigned int blocksNeeded = (dataSize + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    if (blocksNeeded > 10) {
+        std::cout << "Error: Data too large for file" << std::endl;
+        return;
+    }
+    
+    // Free existing blocks
+    for (unsigned int i = 0; i < 10; i++) {
+        if (inode->directBlocks[i] != 0) {
+            freeBlock(inode->directBlocks[i]);
+            inode->directBlocks[i] = 0;
+        }
+    }
+    
+    // Allocate new blocks and write data
+    unsigned int bytesWritten = 0;
+    for (unsigned int i = 0; i < blocksNeeded; i++) {
+        unsigned int blockNum = allocateBlock();
+        if (blockNum == 0) {
+            std::cout << "Error: Failed to allocate block for file" << std::endl;
+            break;
+        }
+        
+        inode->directBlocks[i] = blockNum;
+        
+        // Copy data to block
+        unsigned int bytesToWrite = std::min(dataSize - bytesWritten, BLOCK_SIZE);
+        memcpy(memory + blockNum * BLOCK_SIZE, data.c_str() + bytesWritten, bytesToWrite);
+        bytesWritten += bytesToWrite;
+    }
+    
+    // Update file size
+    inode->size = bytesWritten;
+    inode->modificationTime = time(nullptr);
+    
+    std::cout << "Wrote " << bytesWritten << " bytes to file: " << path << std::endl;
+}
+
+void FileSystem::dumpSuperBlock() {
+    SuperBlock* superBlock = reinterpret_cast<SuperBlock*>(memory);
+    std::cout << "SuperBlock:" << std::endl;
+    std::cout << "Magic: 0x" << std::hex << superBlock->magic << std::dec << std::endl;
+    std::cout << "Block Size: " << superBlock->blockSize << std::endl;
+    std::cout << "Total Blocks: " << superBlock->totalBlocks << std::endl;
+    std::cout << "Free Blocks: " << superBlock->freeBlocks << std::endl;
+    std::cout << "First Free Block: " << superBlock->firstFreeBlock << std::endl;
+    std::cout << "Max Inodes: " << superBlock->maxInodes << std::endl;
+    std::cout << "Free Inodes: " << superBlock->freeInodes << std::endl;
+    std::cout << "First Free Inode: " << superBlock->firstFreeInode << std::endl;
+}
+
+void FileSystem::verifyFreeBlockList() {
+    SuperBlock* superBlock = reinterpret_cast<SuperBlock*>(memory);
+    unsigned int block = superBlock->firstFreeBlock;
+    unsigned int count = 0;
+    
+    std::cout << "Verifying free block list..." << std::endl;
+    
+    while (block != 0 && count < superBlock->totalBlocks) {
+        if (block < FIRST_DATA_BLOCK || block >= TOTAL_BLOCKS) {
+            std::cout << "ERROR: Invalid block in free list: " << block << std::endl;
+            break;
+        }
+        
+        unsigned int* nextBlock = reinterpret_cast<unsigned int*>(memory + block * BLOCK_SIZE);
+        block = *nextBlock;
+        count++;
+        
+        if (count > superBlock->totalBlocks) {
+            std::cout << "ERROR: Possible cycle in free block list" << std::endl;
+            break;
+        }
+    }
+    
+    std::cout << "Counted " << count << " blocks in free list (should be " << superBlock->freeBlocks << ")" << std::endl;
+}
+
+void FileSystem::cmdDebug() {
+    std::cout << "=== File System Debug Information ===" << std::endl;
+    dumpSuperBlock();
+    verifyFreeBlockList();
+}
+
+void FileSystem::run() {
+    std::string line;
+    
+    while (true) {
+        std::cout << "fs:" << currentPath << "> ";
+        std::getline(std::cin, line);
+        
+        if (line.empty()) {
+            continue;
+        }
+        
+        std::istringstream iss(line);
+        std::string cmd;
+        iss >> cmd;
+        
+        std::string args;
+        std::getline(iss >> std::ws, args);
+        
+        if (cmd == "exit" || cmd == "quit") {
+            break;
+        } else if (cmd == "ls") {
+            cmdLs(args);
+        } else if (cmd == "cd") {
+            cmdCd(args);
+        } else if (cmd == "mkdir") {
+            cmdMkdir(args);
+        } else if (cmd == "rmdir") {
+            cmdRmdir(args);
+        } else if (cmd == "touch") {
+            cmdTouch(args);
+        } else if (cmd == "rm") {
+            cmdRm(args);
+        } else if (cmd == "cat") {
+            cmdCat(args);
+        } else if (cmd == "write") {
+            cmdWrite(args);
+        } else if (cmd == "debug") {
+            cmdDebug();
+        } else if (cmd == "reinit") {
+            std::cout << "Reinitializing file system..." << std::endl;
+            initializeFileSystem();
+            currentInodeNumber = 0;
+            currentPath = "/";
+            std::cout << "File system reinitialized." << std::endl;
+        } else {
+            std::cout << "Unknown command: " << cmd << std::endl;
+            std::cout << "Available commands: ls, cd, mkdir, rmdir, touch, rm, cat, write, debug, reinit, exit" << std::endl;
+        }
+    }
+    
+    // Save the file system before exiting
+    saveFileSystem();
+}
+
+int main() {
+    // Uncomment this line to delete the existing filesystem.dat file and start fresh
+    // remove("filesystem.dat");
+    
+    FileSystem fs;
+    fs.run();
+    return 0;
+}
+

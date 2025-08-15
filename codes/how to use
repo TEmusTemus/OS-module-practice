@@ -1,0 +1,80 @@
+I can see from the screenshot that your file system simulator is running. You're currently at the root directory of your simulated file system as indicated by the prompt "fs:/>".
+
+## How to Use Your File System Simulator
+
+Here's how to use the commands you've implemented:
+
+### Basic Commands
+
+1. **touch** - Create a new file
+   ```
+   touch filename.txt 1024
+   ```
+   This creates a file named "filename.txt" with a size of 1024 bytes.
+
+2. **rm** - Remove a file
+   ```
+   rm filename.txt
+   ```
+
+3. **mkdir** - Create a new directory
+   ```
+   mkdir documents
+   ```
+
+4. **rmdir** - Remove a directory (must be empty)
+   ```
+   rmdir documents
+   ```
+
+5. **cd** - Change directory
+   ```
+   cd documents
+   cd ..        (go up one level)
+   cd /         (go to root)
+   ```
+
+6. **ls** - List directory contents
+   ```
+   ls
+   ls documents
+   ```
+
+7. **cp** - Copy a file
+   ```
+   cp source.txt destination.txt
+   ```
+
+8. **cat** - Display file contents
+   ```
+   cat filename.txt
+   ```
+
+9. **sum** - Show file system usage summary
+   ```
+   sum
+   ```
+
+10. **exit** - Exit the file system simulator
+    ```
+    exit
+    ```
+
+### Example Usage Sequence
+
+```
+mkdir documents
+mkdir images
+touch hello.txt 512
+ls
+cd documents
+touch report.txt 1024
+ls
+cd ..
+cp hello.txt documents/hello_copy.txt
+ls documents
+cat documents/report.txt
+sum
+```
+
+The simulator appears to be working correctly based on the prompt shown in your screenshot. Try using some of these commands to verify that all functionality is working as expected.
